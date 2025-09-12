@@ -1,0 +1,16 @@
+numpy
+pandas
+scipy
+matplotlib
+seaborn
+statsmodels
+scikit-learn
+jupyter
+notebook
+plotly
+openpyxl
+xlrd
+pyarrow
+fastparquet
+tqdm
+ipywidgets

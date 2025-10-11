@@ -214,10 +214,6 @@ def var_from_returns(returns: pd.Series = None,
     }
 
 
-import numpy as np
-import pandas as pd
-from scipy import stats as st
-
 def var_mc_t_from_returns(returns: pd.Series,
                           alpha: float = 0.05,
                           n_samples: int = 100_000,
@@ -263,3 +259,229 @@ def var_mc_t_from_returns(returns: pd.Series,
         "VaR Absolute": abs(var_q),
         "VaR Diff from Mean": sims.mean() - var_q,
     }
+
+
+
+# ---------- ES from Normal (closed-form; use empirical mean & std) ----------
+def es_normal(returns: pd.Series, alpha: float = 0.05):
+    """
+    Compute ES under Normal using empirical mean and std.
+    VaR_alpha = mu + sigma * Phi^{-1}(alpha)
+    ES_alpha  = mu - sigma * phi(z_alpha) / alpha
+    """
+    returns = returns.squeeze().dropna().astype(float)
+    mu_hat = returns.mean()
+    sigma_hat = returns.std(ddof=1)
+    z = st.norm.ppf(alpha)
+
+    es_ = mu_hat - sigma_hat * st.norm.pdf(z) / alpha
+    return {
+        "ES Absolute": abs(es_),
+        "ES Diff from Mean": returns.mean() - es_,
+    }
+
+
+# ---------- 8.5: ES from t (closed-form; fit df, loc, scale from data) ----------
+def es_t(returns: pd.Series, alpha: float = 0.05):
+    """
+    Closed-form VaR/ES for Student-t with fitted parameters.
+    ES_alpha  = mu - sigma * [ f_t(t_alpha)*(df + t_alpha^2) / ((df-1)*alpha) ]
+                (valid for df > 1)
+    """
+    returns = returns.squeeze().dropna().astype(float)
+    df_hat, mu_hat, sigma_hat = st.t.fit(returns.values)
+    if df_hat <= 1:
+        raise ValueError(f"Fitted df <= 1 ({df_hat:.3f}); ES formula requires df > 1.")
+    t_alpha = st.t.ppf(alpha, df_hat)
+    es_tail_term = (st.t.pdf(t_alpha, df_hat) * (df_hat + t_alpha**2)) / ((df_hat - 1) * alpha)
+    es_ = mu_hat - sigma_hat * es_tail_term
+    return {
+        "ES Absolute": abs(es_),
+        "ES Diff from Mean": returns.mean() - es_,
+    }
+
+
+# ---------- 8.6: ES from Simulation (draw from fitted t; compare to 8.5) ----------
+def es_sim_from_fitted_t(returns: pd.Series, alpha: float = 0.05, n_sim: int = 100_000, random_state: int = 42):
+    """
+    Simulate returns from fitted t(df, loc=mu, scale=sigma) and compute empirical VaR/ES.
+    """
+    returns = returns.squeeze().dropna().astype(float)
+    df_hat, mu_hat, sigma_hat = st.t.fit(returns.values)
+    rng = np.random.default_rng(random_state)
+    sims = mu_hat + sigma_hat * rng.standard_t(df_hat, size=n_sim)
+    # empirical VaR and ES
+    var_sim = np.quantile(sims, alpha, method="linear")
+    es_sim = sims[sims <= var_sim].mean()
+    return {
+        "ES Absolute": abs(es_sim),
+        "ES Diff from Mean": sims.mean() - es_sim,
+    }
+
+
+# ---------- generate Gaussian Copula samples ----------
+def generate_copula_samples(
+    n_assets: int,
+    dist_types: list[str],
+    data: pd.DataFrame | np.ndarray,
+    corr_method: str = "spearman",
+    n_samples: int = 100_000,
+    random_state: int = 42,
+    ):
+    """
+    Generate correlated samples using a Gaussian Copula.
+
+    Parameters
+    ----------
+    n_assets : int
+        Number of assets (must match number of columns in data).
+    dist_types : list[str]
+        List of marginal distribution types, one per asset.
+        Supported: "normal", "t".
+    n_samples : int
+        Number of simulated samples to generate.
+    data : DataFrame or ndarray
+        Historical returns matrix (shape: [n_obs, n_assets]).
+        Used to estimate marginal parameters and correlation.
+    corr_method : {"spearman", "pearson"}, default "spearman"
+        Method to estimate correlation matrix from data.
+        Spearman is more robust to outliers.
+    random_state : int or Generator or None, optional
+        Random seed or NumPy random generator.
+
+    Returns
+    -------
+    samples : np.ndarray
+        Simulated joint samples (shape: [n_samples, n_assets]),
+        each column follows its fitted marginal distribution.
+    R : np.ndarray
+        Estimated correlation matrix used in the Copula.
+    params : list[dict]
+        Fitted parameters of each marginal (mu, sigma, df if applicable).
+    """
+    rng = np.random.default_rng(random_state)
+    X = np.asarray(data, dtype=float)
+    assert X.shape[1] == n_assets, "n_assets must match number of columns in data"
+    assert len(dist_types) == n_assets, "dist_types length must equal n_assets"
+
+    # ---- 1) Fit marginal distributions automatically ----
+    marginals = []
+    for j, dist_name in enumerate(dist_types):
+        x = X[:, j]
+        name = dist_name.lower()
+
+        if name == "normal":
+            mu, sigma = np.mean(x), np.std(x, ddof=1)
+            F = lambda v, mu=mu, sigma=sigma: st.norm.cdf(v, mu, sigma)
+            Finv = lambda u, mu=mu, sigma=sigma: st.norm.ppf(u, mu, sigma)
+            params = {"mu": mu, "sigma": sigma}
+
+        elif name == "t":
+            df_hat, mu, sigma = st.t.fit(x)
+            F = lambda v, df=df_hat, mu=mu, sigma=sigma: st.t.cdf((v - mu) / sigma, df)
+            Finv = lambda u, df=df_hat, mu=mu, sigma=sigma: mu + sigma * st.t.ppf(u, df)
+            params = {"mu": mu, "sigma": sigma, "df": df_hat}
+
+        else:
+            raise ValueError(f"Unsupported marginal type: {name}")
+
+        marginals.append({"F": F, "Finv": Finv, "params": params})
+
+    # ---- 2) Estimate correlation matrix R ----
+    U = np.column_stack([marginals[j]["F"](X[:, j]) for j in range(n_assets)])
+
+    if corr_method.lower() == "spearman":
+        res = st.spearmanr(U, axis=0)
+        rho = getattr(res, "correlation", res[0])
+
+        # If it's a scalar (e.g., 2 assets), expand to 2×2 matrix
+        if np.isscalar(rho):
+            R = np.array([[1.0, rho],
+                        [rho, 1.0]])
+        else:
+            R = np.asarray(rho, dtype=float)
+
+    elif corr_method.lower() == "pearson":
+        Z = st.norm.ppf(np.clip(U, 1e-12, 1 - 1e-12))
+        R = np.corrcoef(Z, rowvar=False).astype(float)
+
+    else:
+        raise ValueError("corr_method must be 'spearman' or 'pearson'")
+
+    R = near_psd_correlation(pd.DataFrame(R)).values
+
+    # ---- 3) Sample from multivariate normal in Z-space ----
+    Z = st.multivariate_normal.rvs(mean=np.zeros(n_assets), cov=R, size=n_samples, random_state=rng)
+    if Z.ndim == 1:
+        Z = Z[None, :]
+
+    # ---- 4) Map to uniform, then to marginal space ----
+    U_sim = st.norm.cdf(Z)
+    samples = np.column_stack([marginals[j]["Finv"](U_sim[:, j]) for j in range(n_assets)])
+
+    params_list = [m["params"] for m in marginals]
+    return samples, R, params_list
+
+
+def portfolio_var_es_sim(prices, holdings, returns, alpha = 0.05):
+    """
+    Compute VaR and ES for each asset and the total portfolio based on simulated returns.
+
+    Parameters
+    ----------
+    prices : array-like
+        Current prices of each asset.
+    holdings : array-like
+        Holdings (number of shares or units) of each asset.
+    returns : np.ndarray
+        Simulated or historical returns, shape = (n_samples, n_assets).
+    alpha : float, default 0.05
+        Tail probability (e.g. 0.05 for 95% confidence level).
+
+    Returns
+    -------
+    out : pd.DataFrame
+        Table containing VaR95, ES95 (monetary and percentage) for each asset and total.
+    """
+    prices   = np.asarray(prices, dtype=float)
+    holdings = np.asarray(holdings, dtype=float)
+    samples  = np.asarray(returns, dtype=float)
+    n_assets = samples.shape[1]
+
+    values0   = prices * holdings
+    V0_total  = values0.sum()
+
+    # Simulated prices and portfolio values
+    prices_sim = (1.0 + samples) * prices
+    values_sim = prices_sim * holdings
+    pnl_assets = values_sim - values0
+    pnl_total  = pnl_assets.sum(axis=1)
+
+    # Helper function: VaR & ES
+    def var_es(x, alpha):
+        q = np.quantile(x, alpha)
+        es = x[x <= q].mean()
+        return -q, -es  # positive losses
+
+    # Compute per-asset results
+    rows = []
+    for i in range(n_assets):
+        VaR, ES = var_es(pnl_assets[:, i], alpha)
+        rows.append([
+            f"Asset_{i+1}",
+            VaR, ES,
+            VaR / values0[i],
+            ES / values0[i]
+        ])
+
+    # Portfolio total
+    VaR_tot, ES_tot = var_es(pnl_total, alpha)
+    rows.append([
+        "Total",
+        VaR_tot, ES_tot,
+        VaR_tot / V0_total,
+        ES_tot / V0_total
+    ])
+
+    out = pd.DataFrame(rows, columns=["Stock", "VaR", "ES", "VaR_Pct", "ES_Pct"])
+    return out

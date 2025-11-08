@@ -10,16 +10,41 @@ def _to_corr_from_cov(S: np.ndarray):
     std = np.sqrt(np.diag(S))
     std = np.where(std <= 0.0, 1.0, std)
     D_inv = np.diag(1.0 / std)
-    R = D_inv @ S @ D_inv
+    R = _symm(D_inv @ S @ D_inv)
+    np.fill_diagonal(R, 1.0)
     return R, std
 
 def _to_cov_from_corr(R: np.ndarray, std: np.ndarray):
+    R = _symm(np.asarray(R, dtype=float))
+    np.fill_diagonal(R, 1.0)
     D = np.diag(std)
-    return D @ R @ D
+    S = D @ R @ D
+    return _symm(S)
+
+def calculate_cov(X: np.ndarray) -> np.ndarray:
+    """
+    Compute the sample covariance matrix (unbiased, denominator = n - 1).
+
+    Parameters
+    ----------
+    X : np.ndarray, shape = (n_samples, n_features)
+        Each row represents one observation (e.g., one time point or sample)
+        Each column represents one variable / asset (e.g., returns of a stock)
+    """
+    Xc = X - X.mean(axis=0, keepdims=True)
+    return _symm((Xc.T @ Xc) / (X.shape[0] - 1))
+
+
+def fit_normal(data):
+    data = np.asarray(data).ravel()
+    mu = data.mean()
+    sigma = data.std(ddof=1) 
+    return mu, sigma
 
 # ---------- Rebonato–Jäckel (near-PSD) ----------
 def near_psd_correlation(R_df: pd.DataFrame, eps: float = 0.0) -> pd.DataFrame:
     C = _symm(R_df.values)
+    np.fill_diagonal(C, 1.0)
     eigvals, S = np.linalg.eigh(C)
     lam_p = np.maximum(eigvals, eps)           # clip eigenvalues
 
@@ -34,7 +59,7 @@ def near_psd_correlation(R_df: pd.DataFrame, eps: float = 0.0) -> pd.DataFrame:
     C_hat = _symm(B @ B.T)
 
     # normalize to diag=1
-    d = np.sqrt(np.diag(C_hat))
+    d = np.sqrt(np.clip(np.diag(C_hat), 1e-15, None))
     C_hat = C_hat / np.outer(d, d)
     np.fill_diagonal(C_hat, 1.0)
 
@@ -50,6 +75,7 @@ def near_psd_covariance(S_df: pd.DataFrame, eps: float = 0.0) -> pd.DataFrame:
 # ---------- Higham (nearest correlation) ----------
 def higham_correlation(R_df: pd.DataFrame, tol: float = 1e-8, max_iter: int = 200) -> pd.DataFrame:
     X = _symm(R_df.values.copy())
+    np.fill_diagonal(X, 1.0)
     for _ in range(max_iter):
         # PSD projection
         w, V = np.linalg.eigh(_symm(X))
@@ -100,11 +126,35 @@ def simulate_multivariate_normal(
     return_info: bool = False
 ) -> np.ndarray | tuple[np.ndarray, dict]:
     """
-    Simulate X ~ N(mean, cov) robustly.
-      - mean: scalar 0 or array-like (d,)
-      - cov:  (d x d) covariance (DataFrame or ndarray)
-      - If PD (min eig > tol): use Cholesky
-      - Else: eigen-decompose and clip eigvals below tol to 0
+    Simulate samples from a multivariate normal distribution X ~ N(mean, cov).
+
+    Parameters
+    ----------
+    mean : float or array-like of shape (d,)
+        Mean vector of the distribution. If a scalar is given, it's broadcast to all dimensions.
+        d = number of variables (features).
+    cov : array-like of shape (d, d)
+        Covariance matrix. Must be symmetric and positive semi-definite.
+    n_samples : int, default=100_000
+        Number of samples to generate (number of rows in the output).
+    seed : int, default=42
+        Random seed for reproducibility.
+    tol : float, default=1e-10
+        Tolerance for eigenvalue clipping in near-PSD handling.
+    return_info : bool, default=False
+        If True, also return diagnostic information.
+
+    Returns
+    -------
+    X : np.ndarray of shape (n_samples, d)
+        Simulated samples where:
+          - Each **row** represents one observation (sample draw)
+          - Each **column** represents one variable / dimension.
+    info : dict (optional)
+        Contains:
+            - "factorization": method used ("chol" or "eigh-clip")
+            - "pd_check": definiteness check result
+            - "tol": tolerance used
     """
     rng = np.random.default_rng(seed)
 
@@ -136,19 +186,18 @@ def simulate_multivariate_normal(
 
     # Draw samples
     Z = rng.standard_normal((n_samples, d))
-    mu = np.zeros(d) if np.isscalar(mean) else np.asarray(mean).reshape(1, -1)
+    if np.isscalar(mean):
+        mu = np.full((1, d), float(mean))
+    else:
+        mu = np.asarray(mean, dtype=float).reshape(1, -1)
+        if mu.shape[1] != d:
+            raise ValueError("mean length must equal cov dimension.")
     X = Z @ L.T + mu
 
     if return_info:
         info = {"factorization": used, "pd_check": chk, "tol": tol}
         return X, info
     return X
-
-# ---------- calculate covariance matrix----------
-def calculate_cov(X: np.ndarray) -> np.ndarray:
-    """Sample covariance matrix (unbiased, n-1 in denominator)."""
-    Xc = X - X.mean(axis=0, keepdims=True)
-    return (Xc.T @ Xc) / (X.shape[0] - 1)
 
 
 # --- PCA reduce covariance to >= 99% explained ---
@@ -162,7 +211,13 @@ def pca_covariance(cov_df: pd.DataFrame, threshold: float = 0.99):
     idx = np.argsort(w)[::-1]                   # sort descending
     w, V = w[idx], V[:, idx]
 
-    explained_ratio = w / w.sum()
+    w = np.maximum(w, 0.0)
+    s = w.sum()
+    if s <= 0:
+        # 退化情形：全零方差
+        return cov_df.copy()*0.0, 0, np.zeros_like(w)
+
+    explained_ratio = w / s
     cum = np.cumsum(explained_ratio)
     k = int(np.searchsorted(cum, threshold) + 1)
 
@@ -200,17 +255,16 @@ def var_from_returns(returns: pd.Series = None,
     
     # ---- t distribution VaR ----
     elif dist.lower() == "t":
-        nu, mu, sigma = st.t.fit(returns)
+        nu, mu, sigma = st.t.fit(r)
         t_alpha = st.t.ppf(alpha, nu)
-        print(nu)
         var_quantile = mu + t_alpha * sigma
     
     else:
         raise ValueError("dist must be 'normal' or 't'")
     
     return {
-        "VaR Absolute": abs(var_quantile),
-        "VaR Diff from Mean": mu - var_quantile
+        "VaR Absolute(distance from 0)": abs(var_quantile),
+        # "VaR Diff from Mean": mu - var_quantile
     }
 
 
@@ -244,7 +298,6 @@ def var_mc_t_from_returns(returns: pd.Series,
     dict with:
         - "VaR Absolute": magnitude of loss (positive number).
         - "VaR Diff from Mean": quantile relative to mean (typically negative).
-        - "params": dictionary of fitted t-distribution parameters (df, loc, scale).
     """
     r = returns.squeeze().dropna().astype(float)
     nu, loc, scale = st.t.fit(r.values) 
@@ -256,8 +309,8 @@ def var_mc_t_from_returns(returns: pd.Series,
     var_q = np.quantile(sims, alpha)
 
     return {
-        "VaR Absolute": abs(var_q),
-        "VaR Diff from Mean": sims.mean() - var_q,
+        "VaR Absolute(distance from 0)": abs(var_q),
+        # "VaR Diff from Mean": sims.mean() - var_q,
     }
 
 
@@ -276,8 +329,8 @@ def es_normal(returns: pd.Series, alpha: float = 0.05):
 
     es_ = mu_hat - sigma_hat * st.norm.pdf(z) / alpha
     return {
-        "ES Absolute": abs(es_),
-        "ES Diff from Mean": returns.mean() - es_,
+        "ES Absolute(distance from 0)": abs(es_),
+        # "ES Diff from Mean": returns.mean() - es_,
     }
 
 
@@ -296,8 +349,8 @@ def es_t(returns: pd.Series, alpha: float = 0.05):
     es_tail_term = (st.t.pdf(t_alpha, df_hat) * (df_hat + t_alpha**2)) / ((df_hat - 1) * alpha)
     es_ = mu_hat - sigma_hat * es_tail_term
     return {
-        "ES Absolute": abs(es_),
-        "ES Diff from Mean": returns.mean() - es_,
+        "ES Absolute(distance from 0)": abs(es_),
+        # "ES Diff from Mean": returns.mean() - es_,
     }
 
 
@@ -485,3 +538,348 @@ def portfolio_var_es_sim(prices, holdings, returns, alpha = 0.05):
 
     out = pd.DataFrame(rows, columns=["Stock", "VaR", "ES", "VaR_Pct", "ES_Pct"])
     return out
+
+def ew_cov_corr_normalized(df: pd.DataFrame, lam: float = 0.97, window: int | None = None):
+    X = df.to_numpy(copy=False)
+    if window is not None:
+        X = X[-window:, :]
+    n, k = X.shape
+
+    # normalized weights: newest obs has exponent 0
+    exponents = np.arange(n-1, -1, -1, dtype=float)
+    w_raw = (1.0 - lam) * (lam ** exponents)
+    w = w_raw / w_raw.sum()
+    w = w.reshape(-1, 1)
+
+    # mean over the same window (can switch to simple mean if needed)
+    mu = (w.T @ X) / w.sum()
+    # mu = X.mean(axis=0, keepdims=True)   # simple mean alternative
+
+    XC = X - mu
+    cov = (XC.T * w.ravel()) @ XC
+
+    std = np.sqrt(np.diag(cov))
+    denom = np.outer(std, std)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = cov / denom
+    corr[np.isnan(corr)] = 0.0
+
+    cov_df = pd.DataFrame(cov, index=df.columns, columns=df.columns)
+    corr_df = pd.DataFrame(corr, index=df.columns, columns=df.columns)
+    return cov_df, corr_df
+
+def pairwise_cov_corr(df):
+    cols = df.columns
+    n = len(cols)
+    cov = pd.DataFrame(index=cols, columns=cols, dtype=float)
+    corr = pd.DataFrame(index=cols, columns=cols, dtype=float)
+    
+    for i in range(n):
+        for j in range(n):
+            x = df.iloc[:, i]
+            y = df.iloc[:, j]
+            valid = x.notna() & y.notna()
+            if valid.sum() > 1:
+                cov.iloc[i, j] = x[valid].cov(y[valid])
+                corr.iloc[i, j] = x[valid].corr(y[valid], method="pearson")
+            else:
+                cov.iloc[i, j] = None 
+                corr.iloc[i, j] = None
+    return cov,corr
+
+
+def bs_european_greeks(S, K, T, r, q, sigma, option_type='call'):
+    """
+    Compute European option price and Greeks under the
+    Black-Scholes-Merton (BSM) model with continuous dividend yield q.
+
+    Parameters
+    ----------
+    S : float
+        Current underlying price.
+    K : float
+        Strike price.
+    T : float
+        Time to maturity (in years).
+    r : float
+        Risk-free rate (continuous compounding).
+    q : float
+        Continuous dividend yield.
+    sigma : float
+        Annual volatility.
+    option_type : str
+        'call' or 'put'.
+
+    Returns
+    -------
+    dict
+        {'Price', 'Delta', 'Gamma', 'Vega', 'Theta', 'Rho'}
+    """
+
+    # Ensure numeric inputs
+    S, K, T, r, q, sigma = map(float, [S, K, T, r, q, sigma])
+
+    # Core BSM components
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+
+    if option_type.lower() == 'call':
+        price = S * np.exp(-q * T) * st.norm.cdf(d1) - K * np.exp(-r * T) * st.norm.cdf(d2)
+        delta = np.exp(-q * T) * st.norm.cdf(d1)
+        rho = K * T * np.exp(-r * T) * st.norm.cdf(d2)
+        theta = (-S * np.exp(-q * T) * st.norm.pdf(d1) * sigma / (2 * np.sqrt(T))
+                 - r * K * np.exp(-r * T) * st.norm.cdf(d2)
+                 + q * S * np.exp(-q * T) * st.norm.cdf(d1))
+    else:
+        price = K * np.exp(-r * T) * st.norm.cdf(-d2) - S * np.exp(-q * T) * st.norm.cdf(-d1)
+        delta = np.exp(-q * T) * (st.norm.cdf(d1) - 1)
+        rho = -K * T * np.exp(-r * T) * st.norm.cdf(-d2)
+        theta = (-S * np.exp(-q * T) * st.norm.pdf(d1) * sigma / (2 * np.sqrt(T))
+                 + r * K * np.exp(-r * T) * st.norm.cdf(-d2)
+                 - q * S * np.exp(-q * T) * st.norm.cdf(-d1))
+
+    gamma = np.exp(-q * T) * st.norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    vega = S * np.exp(-q * T) * st.norm.pdf(d1) * np.sqrt(T)
+
+    return {
+        'Price': price,
+        'Delta': delta,
+        'Gamma': gamma,
+        'Vega': vega,
+        'Rho': rho,
+        'Theta': theta
+    }
+
+
+def bt_american_continuous_div(S, K, T, r, q, sigma, steps, option_type='call'):
+    """
+    American Option Binomial Tree Model with Continuous Dividend Yield (q).
+    Uses the standard recombining tree approach (Cox-Ross-Rubinstein/Jarrow-Rudd type).
+    
+    Parameters
+    ----------
+    S : float         # Current underlying asset price
+    K : float         # Strike price
+    T : float         # Time to maturity (in years)
+    r : float         # Risk-free interest rate (continuous compounding)
+    q : float         # Continuous dividend yield
+    sigma : float     # Annual volatility
+    steps : int       # Number of time steps in the binomial tree
+    option_type : str # 'call' or 'put'
+    
+    Returns
+    -------
+    float : American option price at t=0
+    """
+    
+    # --- 1. Parameter Setup ---
+    dt = T / steps
+    u = np.exp(sigma * np.sqrt(dt))
+    d = 1 / u
+    # Risk-neutral probability (using r - q as the cost of carry)
+    p = (np.exp((r - q) * dt) - d) / (u - d)     
+    disc = np.exp(-r * dt)
+    
+    # Determine option type factor (z=1 for call, z=-1 for put)
+    z = 1 if option_type.lower() == 'call' else -1
+
+    # --- 2. Initialization ---
+    
+    # V is a 2D array to store option values at each node. 
+    # V[i, j] is the option value at time step j, with i up-moves.
+    V = np.zeros((steps + 1, steps + 1))
+    
+    # Calculate stock prices at maturity (j = steps)
+    # ST[i] = S * u^i * d^(steps - i)
+    ST = S * (u ** np.arange(steps + 1)) * (d ** np.arange(steps, -1, -1))
+    
+    # Calculate Payoff at maturity (j = steps)
+    V[:, steps] = np.maximum(0, z * (ST - K))
+    
+    # --- 3. Backward Induction ---
+    
+    # Loop backwards from the last time step to t=0
+    for j in range(steps - 1, -1, -1):
+        
+        # Calculate Continuation Value (Expected discounted value of holding the option)
+        # Use vectorized operations on the V-values from the next time step (j+1)
+        continuation_value = disc * (p * V[1:j+2, j+1] + (1 - p) * V[0:j+1, j+1])
+        
+        # Calculate Stock Prices at current time step (j)
+        Sj = S * (u ** np.arange(j + 1)) * (d ** np.arange(j, -1, -1))
+        
+        # Calculate Immediate Exercise Value (Intrinsic Value)
+        intrinsic_value = np.maximum(0, z * (Sj - K))
+        
+        # American Option Check: V[j] = max(Intrinsic Value, Continuation Value)
+        V[0:j+1, j] = np.maximum(continuation_value, intrinsic_value)
+
+    # Return the option price at t=0 (V[0, 0])
+    return V[0, 0]
+
+
+def american_binomial_with_greeks(S, K, T, r, q, sigma, steps=200, option_type='call'):
+    """
+    Computes American option price and Greeks (Delta, Gamma, Vega, Rho, Theta)
+    using the bt_american_continuous_div function and central finite-difference 
+    approximations.
+
+    Parameters
+    ----------
+    S : float
+        Current underlying price.
+    ... (other parameters similar to the pricing function)
+
+    Returns
+    -------
+    dict : { 'Price', 'Delta', 'Gamma', 'Vega', 'Theta', 'Rho' }
+    """
+
+    # --- Small perturbations for finite difference ---
+    dS = 0.01 * S       # Perturbation for underlying price (Delta, Gamma)
+    dSigma = 0.01 * sigma  # Perturbation for volatility (Vega)
+    dR = 0.0001         # Perturbation for interest rate (Rho)
+    dT = 1 / 365.0      # Perturbation for time (Theta), typically one day
+
+    # --- Base price calculation ---
+    base = bt_american_continuous_div(S, K, T, r, q, sigma, steps, option_type)
+
+    # --- Price w.r.t. S (Delta & Gamma) ---
+    up = bt_american_continuous_div(S + dS, K, T, r, q, sigma, steps, option_type)
+    down = bt_american_continuous_div(S - dS, K, T, r, q, sigma, steps, option_type)
+    
+    # Central Difference for Delta
+    delta = (up - down) / (2 * dS)
+    # Second-order Central Difference for Gamma
+    gamma = (up - 2 * base + down) / (dS ** 2)
+
+    # --- Price w.r.t. volatility (Vega) ---
+    vega_price = bt_american_continuous_div(S, K, T, r, q, sigma + dSigma, steps, option_type)
+    # Forward Difference for Vega
+    vega = (vega_price - base) / dSigma
+
+    # --- Price w.r.t. interest rate (Rho) ---
+    rho_price = bt_american_continuous_div(S, K, T, r + dR, q, sigma, steps, option_type)
+    # Forward Difference for Rho
+    rho = (rho_price - base) / dR
+
+    # --- Price w.r.t. time (Theta) ---
+    # Time decay is V(t+dt) - V(t) or V(T - dT) - V(T) 
+    theta_price = bt_american_continuous_div(S, K, T - dT, r, q, sigma, steps, option_type)
+    # Note: Theta is defined as -dV/dt, so we use a negative sign in the denominator: (V(T-dT) - V(T)) / (-dT)
+    theta = (theta_price - base) / (-dT)
+
+    return {
+        'Price': base,
+        'Delta': delta,
+        'Gamma': gamma,
+        'Vega': vega,
+        'Rho': rho,
+        'Theta': theta
+    }
+
+
+def bt_american_discrete_div(S, K, T, r, divAmts, divTimes, sigma, steps, option_type='call'):
+    """
+    American Option Binomial Tree Model with Discrete Cash Dividends (D).
+    Uses a recursive approach to adjust the stock price at each dividend date.
+
+    The model assumes the stock price drops by the dividend amount D at the ex-dividend date.
+
+    Parameters
+    ----------
+    S : float                 # Current underlying asset price
+    K : float                 # Strike price
+    T : float                 # Time to maturity (in years)
+    r : float                 # Risk-free interest rate
+    divAmts : list/array      # Dividend amounts [D1, D2, ...]
+    divTimes : list/array     # Dividend dates (as time steps, e.g., [50, 100, ...])
+    sigma : float             # Annual volatility
+    steps : int               # Total number of time steps (N)
+    option_type : str         # 'call' or 'put'
+
+    Returns
+    -------
+    float : American option price at t=0
+    """
+    
+    # Convert inputs to numpy arrays for consistency
+    divAmts = np.array(divAmts)
+    divTimes = np.array(divTimes)
+    
+    # --- 1. Base Case / Boundary Check ---
+    
+    # If no more dividends or next dividend is outside the current grid, 
+    # revert to the standard American option price (with continuous dividend q=0, so b=r).
+    if divAmts.size == 0 or (divTimes.size > 0 and divTimes[0] > steps):
+        # We use q=0.0 because the discrete dividends are already accounted for.
+        return bt_american_continuous_div(S, K, T, r, q=0.0, sigma=sigma, steps=steps, option_type=option_type)
+        
+    # --- 2. Parameter Setup for the current segment (up to the first dividend) ---
+    
+    dt = T / steps
+    u = np.exp(sigma * np.sqrt(dt))
+    d = 1 / u
+    # Risk-neutral probability uses only 'r' for drift, as dividends are handled separately
+    p = (np.exp(r * dt) - d) / (u - d)     
+    disc = np.exp(-r * dt)
+    
+    z = 1 if option_type.lower() == 'call' else -1
+    
+    # --- 3. Grid Setup up to the First Dividend Date ---
+    
+    N_div = divTimes[0] # Time step of the first dividend (j)
+    
+    # V array stores values from t=0 up to the first dividend date N_div
+    V = np.zeros((N_div + 1, N_div + 1))
+    
+    # --- 4. Backward Induction (from N_div back to t=0) ---
+
+    for j in range(N_div, -1, -1):
+        # Sj: Stock prices at current time step j
+        Sj = S * (u ** np.arange(j + 1)) * (d ** np.arange(j, -1, -1))
+        
+        if j < N_div:
+            # --- a) Normal Time Step (Before Dividend Date) ---
+            
+            # Continuation Value
+            continuation_value = disc * (p * V[1:j+2, j+1] + (1 - p) * V[0:j+1, j+1])
+            
+            # Intrinsic Value
+            intrinsic_value = np.maximum(0, z * (Sj - K))
+            
+            # American Option Check: max(Continuation, Intrinsic)
+            V[0:j+1, j] = np.maximum(continuation_value, intrinsic_value)
+            
+        else: # j == N_div (First Dividend Date)
+            # --- b) Dividend Date Node (Recursive Call) ---
+            
+            # Iterate through all nodes 'i' at the dividend time j
+            for i in range(j + 1):
+                price = Sj[i]
+                
+                # 1. Exercise Value: Option exercised *before* the dividend is paid
+                val_exercise = np.maximum(0, z * (price - K))
+                
+                # 2. Continuation Value: Option held *through* the dividend payment
+                
+                # Stock price adjusts down by the dividend amount D1 (price - D1)
+                S_adj = price - divAmts[0]
+                
+                # Remaining parameters for the recursive call
+                T_rem = T - N_div * dt
+                N_rem = steps - N_div
+                
+                # Recursive call to price the remaining option (S_adj is the new S)
+                # Subsequent dividend times are adjusted relative to the new start time
+                val_no_exercise = bt_american_discrete_div(
+                    S_adj, K, T_rem, r, 
+                    divAmts[1:], divTimes[1:] - N_div, # Slice the arrays and adjust times
+                    sigma, N_rem, option_type
+                )
+                
+                # American Check: max(Exercise before dividend, Continuation after dividend)
+                V[i, j] = np.maximum(val_no_exercise, val_exercise)
+
+    # Return the option price at t=0
+    return V[0, 0]

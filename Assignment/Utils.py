@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 from scipy import stats as st
+from scipy.optimize import minimize, OptimizeResult
+
 
 # ---------- helpers ----------
 def _symm(A: np.ndarray) -> np.ndarray:
@@ -883,3 +885,386 @@ def bt_american_discrete_div(S, K, T, r, divAmts, divTimes, sigma, steps, option
 
     # Return the option price at t=0
     return V[0, 0]
+
+
+def risk_parity_csd(cov: np.ndarray, budget: np.ndarray | None = None) -> np.ndarray:
+    """
+    Compute Risk Parity portfolio weights using the CSD-based objective.
+
+    Objective:
+        min SSE = Σ_i (CSD_i* - mean(CSD*))²
+        where CSD_i* = (w_i * (Σw)_i / σ_p) / b_i
+        and σ_p = sqrt(wᵀΣw)
+
+    Constraints:
+        Σ_i w_i = 1, w_i ≥ 0
+
+    Parameters
+    ----------
+    cov : np.ndarray
+        Covariance matrix of asset returns, shape (n, n).
+    budget : np.ndarray | None
+        Target risk budget vector (b_i), shape (n,).
+        If None, uses equal budgets (1/n).
+
+    Returns
+    -------
+    w : np.ndarray
+        Risk parity weights satisfying the CSD-based equal risk contribution condition.
+    """
+    n = cov.shape[0]
+    if budget is None:
+        budget = np.ones(n) / n
+    else:
+        budget = budget / np.sum(budget)
+
+    # --- Helper functions ---
+    def portfolio_vol(w):
+        return np.sqrt(np.dot(w, cov @ w))
+
+    def csd_star(w):
+        sigma_p = portfolio_vol(w)
+        csd = w * (cov @ w) / sigma_p      # element-wise
+        csd_star = csd / budget            # normalize by risk budget
+        return csd_star
+
+    # --- Objective: SSE of normalized CSDs ---
+    def objective(w):
+        csd_s = csd_star(w)
+        return np.sum((csd_s - csd_s.mean())**2)
+
+    # --- Constraints ---
+    cons = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+    bounds = [(0, 1)] * n
+    w0 = np.ones(n) / n
+
+    res = minimize(objective, w0, bounds=bounds, constraints=cons, method='SLSQP', options={'ftol': 1e-12, 'maxiter': 5000})
+
+    if not res.success:
+        raise RuntimeError(f"Optimization failed: {res.message}")
+
+    return res.x
+
+
+def max_sharpe_ratio(mu, cov, rf=0.0, bounds=None, long_only=True):
+    """
+    Maximize Sharpe ratio under normal assumption.
+
+    Parameters
+    ----------
+    mu : np.ndarray
+        Expected returns (n, )
+    cov : np.ndarray
+        Covariance matrix (n, n)
+    rf : float
+        Risk-free rate
+    bounds : list of (float, float)
+        Bounds for weights. Example: [(0.1, 0.5)] * n
+    long_only : bool
+        If True and no bounds given, default bounds (0, 1)
+        If False, allow shorting with bounds (-1, 1)
+
+    Returns
+    -------
+    w : np.ndarray
+        Portfolio weights that maximize Sharpe ratio.
+    sharpe : float
+        Maximum Sharpe ratio achieved.
+    """
+
+    n = len(mu)
+    if bounds is None:
+        if long_only:
+            bounds = [(0, 1)] * n
+        else:
+            bounds = [(-1, 1)] * n
+
+    def neg_sharpe(w):
+        port_return = w @ mu
+        port_vol = np.sqrt(w @ cov @ w)
+        return -(port_return - rf) / port_vol
+
+    cons = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+    w0 = np.ones(n) / n
+
+    res = minimize(neg_sharpe, w0, bounds=bounds, constraints=cons, method='SLSQP')
+    if not res.success:
+        raise RuntimeError(f"Optimization failed: {res.message}")
+
+    w = res.x
+    sharpe = -(res.fun)
+    return w, sharpe
+
+
+def asset_attribution(returns: pd.DataFrame, init_weights: np.ndarray) -> pd.DataFrame:
+    """
+    Geometric return attribution (with dynamic weights) + risk attribution via regression.
+
+    Math (per your slides)
+    ----------------------
+    Weight evolution (no rebalancing):
+        w*_i,t = w_i,t * (1 + r_i,t)
+        R_t    = sum_i w*_i,t - 1 = w_t · r_t
+        w_i,t+1 = w*_i,t / (1 + R_t)
+
+    Geometric return attribution:
+        R      = prod_t (1 + R_t) - 1
+        GR     = ln(1 + R)
+        K      = GR / R          (if R != 0 else 1)
+        k_t    = ln(1 + R_t) / (K * R_t)  (safe for R_t≈0)
+        A_i    = sum_t k_t * w_i,t * r_i,t
+
+    Risk attribution via regression (OLS):
+        a_i,t  = w_i,t * r_i,t           (weighted asset return series)
+        p_t    = R_t                     (portfolio return series)
+        beta_i = Cov(a_i, p) / Var(p)
+        RA_i   = sigma_p * beta_i = Cov(a_i, p) / sigma_p
+        where sigma_p = std(p_t)
+
+    Parameters
+    ----------
+    returns : pd.DataFrame, shape (T, N)
+        Asset return time series (columns = assets).
+    init_weights : np.ndarray, shape (N,)
+        Initial portfolio weights.
+
+    Returns
+    -------
+    pd.DataFrame
+        Three rows:
+          1) 'TotalReturn'                per-asset arithmetic totals + portfolio total
+          2) 'Geometric Attribution'      per-asset geometric attribution + portfolio geometric total
+          3) 'Risk Attribution (beta·σp)' per-asset regression-based risk attribution; portfolio cell = σ_p
+    """
+    # ---- prep ----
+    n_assets = returns.shape[1]
+    T = returns.shape[0]
+    cols = list(returns.columns)
+
+    w = np.asarray(init_weights, dtype=float).copy()
+    w /= w.sum()
+
+    # store evolving weights and returns
+    Wt = np.zeros((T, n_assets))      # weights at start of each period
+    Rt = np.zeros(T)                  # portfolio return each period
+
+    # ---- evolve weights through time (no rebalancing) ----
+    for t in range(T):
+        r = returns.iloc[t].values
+        Wt[t] = w
+        Rt[t] = float(w @ r)
+        w_star = w * (1 + r)
+        w = w_star / w_star.sum()
+
+    # ---- portfolio totals (arithmetic & geometric) ----
+    R_total = float(np.prod(1 + Rt) - 1)
+    GR_total = float(np.log1p(R_total))
+    K = GR_total / R_total if R_total != 0 else 1.0
+
+    # k_t scaling (handle Rt≈0 safely)
+    kt = np.zeros(T)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        kt = np.log1p(Rt) / (K * Rt)
+    kt[~np.isfinite(kt)] = 0.0
+
+    # ---- geometric attribution per asset ----
+    A = np.zeros(n_assets)
+    for t in range(T):
+        A += kt[t] * Wt[t] * returns.iloc[t].values
+    geo_port_total = float(A.sum())   # ~ GR_total
+
+    # ---- arithmetic total return per asset (for row 1) ----
+    total_ret_assets = (1 + returns).prod().values - 1.0
+
+    # ---- risk attribution via regression ----
+    # a_i,t = w_i,t * r_i,t ; p_t = Rt
+    sigma_p = float(np.std(Rt, ddof=1)) if T > 1 else 0.0
+    RA = np.zeros(n_assets)
+    if sigma_p > 0:
+        p = Rt - Rt.mean()
+        var_p = float(np.var(Rt, ddof=1))
+        for i in range(n_assets):
+            a_i = Wt[:, i] * returns.iloc[:, i].values
+            a_i_c = a_i - a_i.mean()
+            cov_ip = float(np.dot(a_i_c, p) / (T - 1)) if T > 1 else 0.0
+            beta_ip = cov_ip / var_p if var_p > 0 else 0.0
+            RA[i] = sigma_p * beta_ip
+    else:
+        RA[:] = 0.0
+
+    # ---- assemble output ----
+    out = pd.DataFrame({"Value": [
+        "TotalReturn",
+        "Return Attribution",
+        "Vol Attribution (beta·σp)"
+    ]})
+
+    for j, name in enumerate(cols):
+        out[name] = [total_ret_assets[j], A[j], RA[j]]
+
+    out["Portfolio"] = [R_total, geo_port_total, sigma_p]
+    return out
+
+
+import numpy as np
+import pandas as pd
+
+def factor_attribution(
+    asset_returns: pd.DataFrame,     # (T × N) Asset return time series
+    betas: pd.DataFrame,             # (N × K) Asset–factor exposures
+    init_weights: np.ndarray,        # (N,) Initial portfolio weights
+    factor_returns: pd.DataFrame,    # (T × K) Factor return time series
+    include_alpha_risk: bool = True  # Whether to include alpha in risk attribution
+) -> pd.DataFrame:
+    """
+    Perform dynamic-weight geometric factor return attribution and risk attribution.
+
+    The method combines:
+        1) Dynamic weight updates (buy-and-hold drift, no rebalancing)
+        2) Geometric return attribution for each factor and alpha
+        3) Regression-based risk attribution (Cov/σ_p)
+
+    References
+    ----------
+    Portfolio weight evolution:
+        w*_i,t = w_i,t * (1 + r_i,t)
+        R_t    = Σ_i w*_i,t - 1 = w_t · r_t
+        w_i,t+1 = w*_i,t / (1 + R_t)
+
+    Portfolio factor exposure:
+        B_t = Σ_i w_i,t * β_i,·   (1×K vector per period)
+
+    Geometric attribution scaling:
+        R  = Π_t (1 + R_t) - 1
+        GR = ln(1 + R)
+        K  = GR / R
+        k_t = ln(1 + R_t) / (K * R_t)
+
+    Factor and alpha return attribution:
+        A_f = Σ_t k_t * B_{t,f} * F_{t,f}
+        α_t = R_t − Σ_f B_{t,f} F_{t,f}
+        A_α = Σ_t k_t * α_t
+
+    Risk attribution (OLS-based):
+        a_{f,t} = B_{t,f} * F_{t,f}
+        RA_f = Cov(a_f, R) / σ_p
+        σ_p = std(R_t)
+        RA_α = Cov(α, R) / σ_p  (optional)
+    """
+
+    # -------------------------------
+    # 1. Align data shapes and columns
+    # -------------------------------
+    assets = list(asset_returns.columns)
+    betas = betas.reindex(index=assets)          # align rows by asset order
+    factors = list(factor_returns.columns)
+    betas = betas[factors]                       # ensure column order matches factors
+
+    T, N = asset_returns.shape
+    K = len(factors)
+
+    # -------------------------------
+    # 2. Initialize weights
+    # -------------------------------
+    w = np.asarray(init_weights, dtype=float).reshape(-1)
+    if w.shape[0] != N:
+        raise ValueError("init_weights length must match number of assets.")
+    w /= w.sum()                                 # normalize to sum to 1
+
+    # Arrays to store per-period weights and portfolio returns
+    Wt = np.zeros((T, N))
+    Rt = np.zeros(T)
+
+    # -------------------------------
+    # 3. Simulate dynamic weight drift
+    # -------------------------------
+    for t in range(T):
+        r_t = asset_returns.iloc[t].values
+        Wt[t] = w                                # record starting weights
+        Rt[t] = float(w @ r_t)                   # portfolio return for period t
+        w_star = w * (1.0 + r_t)                 # grow by asset return
+        denom = w_star.sum()
+        w = np.ones_like(w) / N if denom <= 0 else w_star / denom
+
+    # -------------------------------
+    # 4. Compute geometric scaling factors
+    # -------------------------------
+    R_total = float(np.prod(1.0 + Rt) - 1.0)
+    GR_total = float(np.log1p(R_total))
+    Kscale = GR_total / R_total if R_total != 0 else 1.0
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        kt = np.log1p(Rt) / (Kscale * Rt)
+    kt[~np.isfinite(kt)] = 0.0                   # handle divide-by-zero
+
+    # -------------------------------
+    # 5. Compute portfolio factor exposures
+    # -------------------------------
+    # B_t = Σ_i w_i,t * β_i,·   (shape: T×K)
+    beta_mat = betas.values
+    Bts = np.zeros((T, K))
+    for t in range(T):
+        Bts[t] = Wt[t] @ beta_mat
+
+    # -------------------------------
+    # 6. Compute factor contributions and alpha
+    # -------------------------------
+    F = factor_returns.values                    # (T×K)
+    a_ft = Bts * F                               # (T×K), factor contributions per period
+    factor_part_t = a_ft.sum(axis=1)             # (T,), total factor part
+    alpha_t = Rt - factor_part_t                 # (T,), residual (alpha)
+
+    # -------------------------------
+    # 7. Geometric return attribution
+    # -------------------------------
+    A_factors = (kt[:, None] * a_ft).sum(axis=0) # (K,), each factor’s contribution
+    A_alpha = float((kt * alpha_t).sum())        # alpha contribution
+    A_port_geo = float(A_factors.sum() + A_alpha)# portfolio geometric return
+
+    # -------------------------------
+    # 8. Regression-based risk attribution
+    # -------------------------------
+    sigma_p = float(np.std(Rt, ddof=1)) if T > 1 else 0.0
+    RA_factors = np.zeros(K)
+    RA_alpha = 0.0
+
+    if sigma_p > 0:
+        p_c = Rt - Rt.mean()
+        var_p = float(np.var(Rt, ddof=1))
+
+        # Factors
+        for j in range(K):
+            x = a_ft[:, j] - a_ft[:, j].mean()
+            cov = float((x @ p_c) / (T - 1)) if T > 1 else 0.0
+            beta = cov / var_p if var_p > 0 else 0.0
+            RA_factors[j] = sigma_p * beta
+
+        # Alpha
+        if include_alpha_risk:
+            x = alpha_t - alpha_t.mean()
+            cov = float((x @ p_c) / (T - 1)) if T > 1 else 0.0
+            beta = cov / var_p if var_p > 0 else 0.0
+            RA_alpha = sigma_p * beta
+
+    # -------------------------------
+    # 9. Aggregate total returns
+    # -------------------------------
+    total_ret_factors = (1.0 + factor_returns).prod().values - 1.0
+    total_ret_alpha = float((1.0 + alpha_t).prod() - 1.0)
+
+    # -------------------------------
+    # 10. Construct output table
+    # -------------------------------
+    out = pd.DataFrame({"Value": ["TotalReturn", "Return Attribution", "Vol Attribution"]})
+
+    # Factor columns
+    for j, f in enumerate(factors):
+        out[f] = [total_ret_factors[j], A_factors[j], RA_factors[j]]
+
+    # Alpha column
+    out["Alpha"] = [total_ret_alpha, A_alpha, RA_alpha]
+
+    # Portfolio column
+    out["Portfolio"] = [R_total, A_port_geo, sigma_p]
+
+    return out
